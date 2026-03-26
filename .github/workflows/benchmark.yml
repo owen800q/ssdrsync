@@ -1,0 +1,357 @@
+name: Benchmark - Copy Speed Test
+
+on:
+  workflow_dispatch:
+    inputs:
+      file_size_gb:
+        description: 'Test file size in GB (default 10, max 30)'
+        required: false
+        default: '10'
+        type: choice
+        options:
+          - '1'
+          - '5'
+          - '10'
+          - '20'
+          - '30'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: System info
+        run: |
+          echo "=== CPU ==="
+          lscpu | grep -E "Model name|CPU\(s\)|Thread|Core"
+          echo ""
+          echo "=== Memory ==="
+          free -h
+          echo ""
+          echo "=== Disk ==="
+          df -h /
+          df -h /tmp || true
+          echo ""
+          echo "=== Kernel ==="
+          uname -r
+
+      - name: Free up disk space
+        run: |
+          echo "Before cleanup:"
+          df -h /
+          # Remove unnecessary preinstalled software to free space
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache
+          sudo apt-get clean
+          echo ""
+          echo "After cleanup:"
+          df -h /
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Prepare test environment
+        run: |
+          FILE_SIZE_GB=${{ inputs.file_size_gb || '10' }}
+          echo "FILE_SIZE_GB=${FILE_SIZE_GB}" >> $GITHUB_ENV
+
+          mkdir -p /tmp/bench_src /tmp/bench_dst_cp /tmp/bench_dst_ssdrsync /tmp/bench_dst_delta
+
+          echo ""
+          echo "============================================"
+          echo "  Generating ${FILE_SIZE_GB}GB test file..."
+          echo "============================================"
+
+          # Use dd with urandom for realistic data (incompressible)
+          dd if=/dev/urandom of=/tmp/bench_src/testfile.bin \
+            bs=1M count=$((FILE_SIZE_GB * 1024)) \
+            status=progress 2>&1
+
+          # Also create some smaller files for parallel test
+          for i in $(seq 1 20); do
+            dd if=/dev/urandom of=/tmp/bench_src/small_${i}.bin \
+              bs=1M count=50 status=none 2>&1
+          done
+
+          echo ""
+          echo "Test files created:"
+          ls -lh /tmp/bench_src/
+          echo ""
+          echo "Total size:"
+          du -sh /tmp/bench_src/
+
+      - name: Benchmark - cp (single large file)
+        run: |
+          echo "============================================"
+          echo "  TEST 1: cp - single ${FILE_SIZE_GB}GB file"
+          echo "============================================"
+
+          # Drop caches before test
+          sync
+          sudo sh -c 'echo 3 > /proc/sys/vm/drop_caches'
+
+          time_start=$(date +%s%N)
+          cp /tmp/bench_src/testfile.bin /tmp/bench_dst_cp/testfile.bin
+          time_end=$(date +%s%N)
+
+          elapsed_ms=$(( (time_end - time_start) / 1000000 ))
+          elapsed_s=$(echo "scale=2; $elapsed_ms / 1000" | bc)
+          file_size_bytes=$(stat -c%s /tmp/bench_src/testfile.bin)
+          speed_mbs=$(echo "scale=2; $file_size_bytes / 1048576 / $elapsed_s" | bc)
+
+          echo ""
+          echo "  cp result: ${elapsed_s}s  (${speed_mbs} MB/s)"
+          echo ""
+
+          echo "CP_TIME=${elapsed_s}" >> $GITHUB_ENV
+          echo "CP_SPEED=${speed_mbs}" >> $GITHUB_ENV
+
+          # Verify
+          md5_src=$(md5sum /tmp/bench_src/testfile.bin | cut -d' ' -f1)
+          md5_dst=$(md5sum /tmp/bench_dst_cp/testfile.bin | cut -d' ' -f1)
+          if [ "$md5_src" = "$md5_dst" ]; then
+            echo "  Checksum: PASS"
+          else
+            echo "  Checksum: FAIL"
+            exit 1
+          fi
+
+      - name: Benchmark - ssdrsync full copy (single large file)
+        run: |
+          echo "============================================"
+          echo "  TEST 2: ssdrsync full - ${FILE_SIZE_GB}GB"
+          echo "============================================"
+
+          # Drop caches
+          sync
+          sudo sh -c 'echo 3 > /proc/sys/vm/drop_caches'
+
+          time_start=$(date +%s%N)
+          ./target/release/ssdrsync \
+            /tmp/bench_src/testfile.bin \
+            /tmp/bench_dst_ssdrsync/testfile.bin \
+            --no-delta --no-progress
+          time_end=$(date +%s%N)
+
+          elapsed_ms=$(( (time_end - time_start) / 1000000 ))
+          elapsed_s=$(echo "scale=2; $elapsed_ms / 1000" | bc)
+          file_size_bytes=$(stat -c%s /tmp/bench_src/testfile.bin)
+          speed_mbs=$(echo "scale=2; $file_size_bytes / 1048576 / $elapsed_s" | bc)
+
+          echo ""
+          echo "  ssdrsync full: ${elapsed_s}s  (${speed_mbs} MB/s)"
+          echo ""
+
+          echo "SSDR_FULL_TIME=${elapsed_s}" >> $GITHUB_ENV
+          echo "SSDR_FULL_SPEED=${speed_mbs}" >> $GITHUB_ENV
+
+          # Verify
+          md5_src=$(md5sum /tmp/bench_src/testfile.bin | cut -d' ' -f1)
+          md5_dst=$(md5sum /tmp/bench_dst_ssdrsync/testfile.bin | cut -d' ' -f1)
+          if [ "$md5_src" = "$md5_dst" ]; then
+            echo "  Checksum: PASS"
+          else
+            echo "  Checksum: FAIL"
+            exit 1
+          fi
+
+      - name: Benchmark - ssdrsync with O_DIRECT (single large file)
+        run: |
+          echo "============================================"
+          echo "  TEST 3: ssdrsync O_DIRECT - ${FILE_SIZE_GB}GB"
+          echo "============================================"
+
+          rm -f /tmp/bench_dst_ssdrsync/testfile.bin
+
+          # Drop caches
+          sync
+          sudo sh -c 'echo 3 > /proc/sys/vm/drop_caches'
+
+          time_start=$(date +%s%N)
+          ./target/release/ssdrsync \
+            /tmp/bench_src/testfile.bin \
+            /tmp/bench_dst_ssdrsync/testfile.bin \
+            --no-delta --no-progress
+          time_end=$(date +%s%N)
+
+          elapsed_ms=$(( (time_end - time_start) / 1000000 ))
+          elapsed_s=$(echo "scale=2; $elapsed_ms / 1000" | bc)
+          file_size_bytes=$(stat -c%s /tmp/bench_src/testfile.bin)
+          speed_mbs=$(echo "scale=2; $file_size_bytes / 1048576 / $elapsed_s" | bc)
+
+          echo ""
+          echo "  ssdrsync O_DIRECT: ${elapsed_s}s  (${speed_mbs} MB/s)"
+          echo ""
+
+          echo "SSDR_DIRECT_TIME=${elapsed_s}" >> $GITHUB_ENV
+          echo "SSDR_DIRECT_SPEED=${speed_mbs}" >> $GITHUB_ENV
+
+          # Verify
+          md5_src=$(md5sum /tmp/bench_src/testfile.bin | cut -d' ' -f1)
+          md5_dst=$(md5sum /tmp/bench_dst_ssdrsync/testfile.bin | cut -d' ' -f1)
+          if [ "$md5_src" = "$md5_dst" ]; then
+            echo "  Checksum: PASS"
+          else
+            echo "  Checksum: FAIL"
+            exit 1
+          fi
+
+      - name: Benchmark - ssdrsync delta sync (no changes)
+        run: |
+          echo "============================================"
+          echo "  TEST 4: ssdrsync delta (no changes)"
+          echo "============================================"
+
+          # File already exists at destination from previous test
+          sync
+          sudo sh -c 'echo 3 > /proc/sys/vm/drop_caches'
+
+          time_start=$(date +%s%N)
+          ./target/release/ssdrsync \
+            /tmp/bench_src/testfile.bin \
+            /tmp/bench_dst_ssdrsync/testfile.bin \
+            --no-progress -v
+          time_end=$(date +%s%N)
+
+          elapsed_ms=$(( (time_end - time_start) / 1000000 ))
+          elapsed_s=$(echo "scale=2; $elapsed_ms / 1000" | bc)
+
+          echo ""
+          echo "  ssdrsync delta (no change): ${elapsed_s}s"
+          echo ""
+
+          echo "SSDR_DELTA_NOCHANGE=${elapsed_s}" >> $GITHUB_ENV
+
+      - name: Benchmark - ssdrsync delta sync (partial change)
+        run: |
+          echo "============================================"
+          echo "  TEST 5: ssdrsync delta (1GB modified)"
+          echo "============================================"
+
+          # Modify last 1GB of the destination to simulate a partial change
+          cp /tmp/bench_dst_ssdrsync/testfile.bin /tmp/bench_dst_delta/testfile.bin
+
+          FILE_SIZE_BYTES=$(stat -c%s /tmp/bench_dst_delta/testfile.bin)
+          MODIFY_OFFSET=$(( FILE_SIZE_BYTES - 1073741824 ))
+          if [ $MODIFY_OFFSET -lt 0 ]; then
+            MODIFY_OFFSET=0
+          fi
+
+          dd if=/dev/urandom of=/tmp/bench_dst_delta/testfile.bin \
+            bs=1M count=1024 seek=$((MODIFY_OFFSET / 1048576)) \
+            conv=notrunc status=none 2>&1
+
+          sync
+          sudo sh -c 'echo 3 > /proc/sys/vm/drop_caches'
+
+          time_start=$(date +%s%N)
+          ./target/release/ssdrsync \
+            /tmp/bench_src/testfile.bin \
+            /tmp/bench_dst_delta/testfile.bin \
+            --no-progress -v
+          time_end=$(date +%s%N)
+
+          elapsed_ms=$(( (time_end - time_start) / 1000000 ))
+          elapsed_s=$(echo "scale=2; $elapsed_ms / 1000" | bc)
+
+          echo ""
+          echo "  ssdrsync delta (1GB changed): ${elapsed_s}s"
+          echo ""
+
+          echo "SSDR_DELTA_PARTIAL=${elapsed_s}" >> $GITHUB_ENV
+
+          # Verify
+          md5_src=$(md5sum /tmp/bench_src/testfile.bin | cut -d' ' -f1)
+          md5_dst=$(md5sum /tmp/bench_dst_delta/testfile.bin | cut -d' ' -f1)
+          if [ "$md5_src" = "$md5_dst" ]; then
+            echo "  Checksum after delta: PASS"
+          else
+            echo "  Checksum after delta: FAIL"
+            exit 1
+          fi
+
+      - name: Benchmark - ssdrsync directory parallel copy
+        run: |
+          echo "============================================"
+          echo "  TEST 6: ssdrsync parallel dir (20x50MB)"
+          echo "============================================"
+
+          # Prepare source with just the small files
+          mkdir -p /tmp/bench_dir_src
+          for i in $(seq 1 20); do
+            cp /tmp/bench_src/small_${i}.bin /tmp/bench_dir_src/
+          done
+          mkdir -p /tmp/bench_dir_dst_cp /tmp/bench_dir_dst_ssdr
+
+          # cp
+          sync
+          sudo sh -c 'echo 3 > /proc/sys/vm/drop_caches'
+
+          time_start=$(date +%s%N)
+          cp -r /tmp/bench_dir_src/* /tmp/bench_dir_dst_cp/
+          time_end=$(date +%s%N)
+
+          elapsed_ms=$(( (time_end - time_start) / 1000000 ))
+          cp_dir_s=$(echo "scale=2; $elapsed_ms / 1000" | bc)
+          echo "  cp dir: ${cp_dir_s}s"
+
+          # ssdrsync parallel
+          sync
+          sudo sh -c 'echo 3 > /proc/sys/vm/drop_caches'
+
+          time_start=$(date +%s%N)
+          ./target/release/ssdrsync \
+            /tmp/bench_dir_src /tmp/bench_dir_dst_ssdr \
+            -j 4 --no-progress
+          time_end=$(date +%s%N)
+
+          elapsed_ms=$(( (time_end - time_start) / 1000000 ))
+          ssdr_dir_s=$(echo "scale=2; $elapsed_ms / 1000" | bc)
+          echo "  ssdrsync dir (-j4): ${ssdr_dir_s}s"
+
+          echo ""
+          echo "CP_DIR_TIME=${cp_dir_s}" >> $GITHUB_ENV
+          echo "SSDR_DIR_TIME=${ssdr_dir_s}" >> $GITHUB_ENV
+
+      - name: Print results summary
+        run: |
+          echo ""
+          echo "╔══════════════════════════════════════════════════════════════╗"
+          echo "║              BENCHMARK RESULTS SUMMARY                      ║"
+          echo "║              File size: ${FILE_SIZE_GB}GB                              ║"
+          echo "╠══════════════════════════════════════════════════════════════╣"
+          echo "║                                                              ║"
+          echo "║  Single large file (${FILE_SIZE_GB}GB):                                ║"
+          echo "║  ┌──────────────────────┬──────────┬─────────────┐          ║"
+          echo "║  │ Method               │ Time     │ Speed       │          ║"
+          echo "║  ├──────────────────────┼──────────┼─────────────┤          ║"
+          printf "║  │ cp                   │ %7ss │ %7s MB/s │          ║\n" "$CP_TIME" "$CP_SPEED"
+          printf "║  │ ssdrsync (full)      │ %7ss │ %7s MB/s │          ║\n" "$SSDR_FULL_TIME" "$SSDR_FULL_SPEED"
+          printf "║  │ ssdrsync (O_DIRECT)  │ %7ss │ %7s MB/s │          ║\n" "$SSDR_DIRECT_TIME" "$SSDR_DIRECT_SPEED"
+          echo "║  └──────────────────────┴──────────┴─────────────┘          ║"
+          echo "║                                                              ║"
+          echo "║  Delta sync:                                                 ║"
+          echo "║  ┌──────────────────────────────┬──────────┐                ║"
+          echo "║  │ Scenario                     │ Time     │                ║"
+          echo "║  ├──────────────────────────────┼──────────┤                ║"
+          printf "║  │ No changes (skip)            │ %7ss │                ║\n" "$SSDR_DELTA_NOCHANGE"
+          printf "║  │ 1GB modified (delta copy)   │ %7ss │                ║\n" "$SSDR_DELTA_PARTIAL"
+          echo "║  └──────────────────────────────┴──────────┘                ║"
+          echo "║                                                              ║"
+          echo "║  Directory (20 x 50MB files):                                ║"
+          echo "║  ┌──────────────────────┬──────────┐                        ║"
+          echo "║  │ Method               │ Time     │                        ║"
+          echo "║  ├──────────────────────┼──────────┤                        ║"
+          printf "║  │ cp -r                │ %7ss │                        ║\n" "$CP_DIR_TIME"
+          printf "║  │ ssdrsync -j4         │ %7ss │                        ║\n" "$SSDR_DIR_TIME"
+          echo "║  └──────────────────────┴──────────┘                        ║"
+          echo "║                                                              ║"
+          echo "╚══════════════════════════════════════════════════════════════╝"
