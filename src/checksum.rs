@@ -1,14 +1,5 @@
 use std::fs::File;
-use std::io::Read;
-
-/// Compute BLAKE3 hash of a file block at a given offset
-pub fn hash_block_at(file: &mut File, offset: u64, block_size: usize) -> std::io::Result<blake3::Hash> {
-    use std::io::Seek;
-    file.seek(std::io::SeekFrom::Start(offset))?;
-    let mut buf = vec![0u8; block_size];
-    let n = read_exact_or_eof(file, &mut buf)?;
-    Ok(blake3::hash(&buf[..n]))
-}
+use std::io::{Read, Seek, SeekFrom};
 
 /// Read exactly buf.len() bytes, or fewer if at EOF
 fn read_exact_or_eof(file: &mut File, buf: &mut [u8]) -> std::io::Result<usize> {
@@ -22,9 +13,9 @@ fn read_exact_or_eof(file: &mut File, buf: &mut [u8]) -> std::io::Result<usize> 
     Ok(total)
 }
 
-/// Compare blocks between source and destination files.
-/// Returns a list of block indices that differ (need to be transferred).
-/// Scans from the end for append-mostly optimization.
+/// Fast block comparison using sequential streaming reads.
+/// Instead of seeking per-block (slow on NAS), reads both files sequentially
+/// and compares BLAKE3 hashes of each block.
 pub fn diff_blocks(
     src: &mut File,
     dst: &mut File,
@@ -34,68 +25,111 @@ pub fn diff_blocks(
 ) -> std::io::Result<DiffResult> {
     let src_blocks = ((src_size + block_size as u64 - 1) / block_size as u64) as usize;
     let dst_blocks = ((dst_size + block_size as u64 - 1) / block_size as u64) as usize;
-
     let common_blocks = src_blocks.min(dst_blocks);
+
+    // For same-size files or when dst is larger, do fast sequential comparison.
+    // For append-mostly pattern (src > dst), skip comparing common prefix from end.
+    if src_size > dst_size && dst_size > 0 {
+        return diff_blocks_append_optimized(src, dst, src_size, dst_size, block_size, src_blocks, dst_blocks);
+    }
+
+    // Sequential forward scan - reads both files linearly (fast I/O pattern)
+    src.seek(SeekFrom::Start(0))?;
+    dst.seek(SeekFrom::Start(0))?;
+
+    let mut src_buf = vec![0u8; block_size];
+    let mut dst_buf = vec![0u8; block_size];
     let mut changed_blocks: Vec<usize> = Vec::new();
 
-    // Compare common blocks - scan from end (append-mostly optimization)
-    // Once we find a matching block scanning backwards, all blocks before it
-    // are likely unchanged too, so we can switch to forward scan for verification
-    let mut backward_mismatch_end = common_blocks;
+    for i in 0..common_blocks {
+        let src_n = read_exact_or_eof(src, &mut src_buf)?;
+        let dst_n = read_exact_or_eof(dst, &mut dst_buf)?;
 
-    // Backward scan: find where changes start from the end
-    for i in (0..common_blocks).rev() {
-        let offset = i as u64 * block_size as u64;
-        let src_hash = hash_block_at(src, offset, block_size)?;
-        let dst_hash = hash_block_at(dst, offset, block_size)?;
-        if src_hash == dst_hash {
-            backward_mismatch_end = i + 1;
-            break;
+        // Fast path: compare raw bytes first (avoids hash for identical blocks)
+        if src_n == dst_n && src_buf[..src_n] == dst_buf[..dst_n] {
+            continue;
         }
+
+        changed_blocks.push(i);
     }
 
-    // If backward scan hit the beginning, check all blocks
-    if backward_mismatch_end == common_blocks {
-        // All blocks might differ, do forward scan
-        for i in 0..common_blocks {
-            let offset = i as u64 * block_size as u64;
-            let src_hash = hash_block_at(src, offset, block_size)?;
-            let dst_hash = hash_block_at(dst, offset, block_size)?;
-            if src_hash != dst_hash {
-                changed_blocks.push(i);
-            }
-        }
-    } else {
-        // Forward scan up to the first matching block from backward scan
-        // and include all blocks from backward_mismatch_end to common_blocks
-        for i in 0..backward_mismatch_end.saturating_sub(1) {
-            let offset = i as u64 * block_size as u64;
-            let src_hash = hash_block_at(src, offset, block_size)?;
-            let dst_hash = hash_block_at(dst, offset, block_size)?;
-            if src_hash != dst_hash {
-                changed_blocks.push(i);
-            }
-        }
-        // Add all blocks from the backward mismatch point to end
-        for i in backward_mismatch_end..common_blocks {
-            let offset = i as u64 * block_size as u64;
-            let src_hash = hash_block_at(src, offset, block_size)?;
-            let dst_hash = hash_block_at(dst, offset, block_size)?;
-            if src_hash != dst_hash {
-                changed_blocks.push(i);
-            }
-        }
-    }
-
-    // New blocks (source is larger)
     let new_blocks: Vec<usize> = (dst_blocks..src_blocks).collect();
-
     let truncate = src_size < dst_size;
 
     Ok(DiffResult {
         changed_blocks,
         new_blocks,
         truncate,
+        new_size: src_size,
+    })
+}
+
+/// Optimized diff for append-mostly files (common with Loki chunks).
+/// Scans backward from the end of the common region to find where changes start,
+/// then only the tail + new blocks need to be transferred.
+fn diff_blocks_append_optimized(
+    src: &mut File,
+    dst: &mut File,
+    src_size: u64,
+    dst_size: u64,
+    block_size: usize,
+    src_blocks: usize,
+    dst_blocks: usize,
+) -> std::io::Result<DiffResult> {
+    let common_blocks = dst_blocks; // dst is smaller
+
+    // Backward scan: find the last matching block from the end of common region
+    let mut first_changed_from_end = common_blocks;
+    let mut src_buf = vec![0u8; block_size];
+    let mut dst_buf = vec![0u8; block_size];
+
+    for i in (0..common_blocks).rev() {
+        let offset = i as u64 * block_size as u64;
+
+        src.seek(SeekFrom::Start(offset))?;
+        let src_n = read_exact_or_eof(src, &mut src_buf)?;
+
+        dst.seek(SeekFrom::Start(offset))?;
+        let dst_n = read_exact_or_eof(dst, &mut dst_buf)?;
+
+        if src_n == dst_n && src_buf[..src_n] == dst_buf[..dst_n] {
+            // This block matches - everything before it is likely unchanged
+            first_changed_from_end = i + 1;
+            break;
+        }
+    }
+
+    // If backward scan reached beginning, all common blocks might differ
+    // Do sequential forward scan for accuracy (still fast - sequential I/O)
+    let mut changed_blocks: Vec<usize> = Vec::new();
+
+    if first_changed_from_end == common_blocks {
+        // Full forward scan needed
+        src.seek(SeekFrom::Start(0))?;
+        dst.seek(SeekFrom::Start(0))?;
+
+        for i in 0..common_blocks {
+            let src_n = read_exact_or_eof(src, &mut src_buf)?;
+            let dst_n = read_exact_or_eof(dst, &mut dst_buf)?;
+
+            if src_n != dst_n || src_buf[..src_n] != dst_buf[..dst_n] {
+                changed_blocks.push(i);
+            }
+        }
+    } else {
+        // Only blocks from first_changed_from_end to end differ
+        for i in first_changed_from_end..common_blocks {
+            changed_blocks.push(i);
+        }
+    }
+
+    // New blocks (source is larger than dest)
+    let new_blocks: Vec<usize> = (dst_blocks..src_blocks).collect();
+
+    Ok(DiffResult {
+        changed_blocks,
+        new_blocks,
+        truncate: false,
         new_size: src_size,
     })
 }

@@ -85,6 +85,66 @@ pub fn preallocate(file: &File, size: u64) {
     }
 }
 
+/// copy_file_range - the fastest kernel copy path (what modern cp uses).
+/// Zero-copy within kernel, supports server-side copy on NFS, reflink on btrfs/xfs.
+pub fn copy_file_range_copy(
+    src: &File,
+    dst: &File,
+    total_size: u64,
+    block_size: usize,
+    mut progress_cb: impl FnMut(u64),
+) -> std::io::Result<u64> {
+    let mut total: u64 = 0;
+    let mut src_off: i64 = 0;
+    let mut dst_off: i64 = 0;
+
+    preallocate(dst, total_size);
+    advise_sequential(src);
+
+    while total < total_size {
+        let remaining = total_size - total;
+        let chunk = remaining.min(block_size as u64) as usize;
+
+        let n = unsafe {
+            libc::syscall(
+                libc::SYS_copy_file_range,
+                src.as_raw_fd(),
+                &mut src_off as *mut i64,
+                dst.as_raw_fd(),
+                &mut dst_off as *mut i64,
+                chunk,
+                0u32, // flags
+            )
+        };
+
+        if n < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::ENOSYS)
+                || err.raw_os_error() == Some(libc::EXDEV)
+                || err.raw_os_error() == Some(libc::EINVAL)
+            {
+                // Not supported, caller should fallback
+                return Err(err);
+            }
+            return Err(err);
+        }
+        if n == 0 {
+            break; // EOF
+        }
+
+        let bytes = n as u64;
+        total += bytes;
+        progress_cb(bytes);
+
+        // Drop page cache periodically to avoid memory pressure
+        if total % (block_size as u64 * 32) == 0 {
+            advise_dontneed(dst, 0, total as i64);
+        }
+    }
+
+    Ok(total)
+}
+
 /// Attempt splice-based zero-copy transfer between two files.
 /// Returns Ok(bytes_copied) or Err if splice is not supported.
 pub fn try_splice_copy(
@@ -126,9 +186,6 @@ pub fn try_splice_copy(
         };
         if n < 0 {
             let err = std::io::Error::last_os_error();
-            if err.raw_os_error() == Some(libc::EINVAL) {
-                break Err(err); // splice not supported
-            }
             break Err(err);
         }
         if n == 0 {
@@ -222,28 +279,22 @@ pub fn direct_copy(
         }
 
         // O_DIRECT requires aligned writes; the last block may be partial
-        let write_size = if n < block_size {
-            // Last partial block: we need to handle this specially
-            // Write the aligned portion with O_DIRECT, then handle remainder
+        if n < block_size {
             let aligned_n = n & !(ALIGNMENT - 1);
             if aligned_n > 0 {
                 write_all_at(dst, &buf.as_slice()[..aligned_n])?;
             }
-            // For the remaining unaligned bytes, we need to drop O_DIRECT
-            // We'll write them as-is and the kernel handles it
             if n > aligned_n {
                 write_all_at(dst, &buf.as_slice()[aligned_n..n])?;
             }
             total += n as u64;
             progress_cb(n as u64);
             continue;
-        } else {
-            n
-        };
+        }
 
-        write_all_at(dst, &buf.as_slice()[..write_size])?;
-        total += write_size as u64;
-        progress_cb(write_size as u64);
+        write_all_at(dst, &buf.as_slice()[..n])?;
+        total += n as u64;
+        progress_cb(n as u64);
     }
 
     // Truncate to exact size (O_DIRECT may have written extra)
