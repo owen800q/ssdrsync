@@ -116,22 +116,59 @@ fn full_copy(
     opts: &TransferOptions,
     mut progress_cb: impl FnMut(u64),
 ) -> Result<TransferResult> {
-    // Try O_DIRECT first
+    // Strategy 1: copy_file_range (fastest - what modern cp uses)
+    // Zero-copy in kernel, supports server-side copy on NFS, reflink on btrfs/xfs
+    if src_size > 0 {
+        if let Ok(result) = try_copy_file_range(src, dst, src_size, opts, &mut progress_cb) {
+            return Ok(result);
+        }
+    }
+
+    // Strategy 2: O_DIRECT with large aligned buffers (best for NAS, avoids page cache)
     if opts.use_direct_io && src_size > 0 {
         if let Ok(result) = try_direct_copy(src, dst, src_size, opts, &mut progress_cb) {
             return Ok(result);
         }
     }
 
-    // Try splice
+    // Strategy 3: splice (zero-copy via pipe)
     if src_size > 0 {
         if let Ok(result) = try_splice_copy(src, dst, src_size, opts, &mut progress_cb) {
             return Ok(result);
         }
     }
 
-    // Fallback to buffered copy
+    // Strategy 4: buffered copy with large buffers (always works)
     buffered_copy(src, dst, src_size, opts, progress_cb)
+}
+
+fn try_copy_file_range(
+    src: &Path,
+    dst: &Path,
+    src_size: u64,
+    opts: &TransferOptions,
+    progress_cb: &mut impl FnMut(u64),
+) -> std::result::Result<TransferResult, ()> {
+    let src_file = File::open(src).map_err(|_| ())?;
+    let dst_file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(dst)
+        .map_err(|_| ())?;
+
+    match io_engine::copy_file_range_copy(&src_file, &dst_file, src_size, opts.block_size, progress_cb) {
+        Ok(bytes) => {
+            // Ensure exact size
+            dst_file.set_len(src_size).ok();
+            Ok(TransferResult {
+                bytes_transferred: bytes,
+                skipped: false,
+                delta_blocks: None,
+            })
+        }
+        Err(_) => Err(()),
+    }
 }
 
 fn try_direct_copy(
