@@ -159,8 +159,6 @@ fn try_copy_file_range(
 
     match io_engine::copy_file_range_copy(&src_file, &dst_file, src_size, opts.block_size, progress_cb) {
         Ok(bytes) => {
-            // Ensure exact size
-            dst_file.set_len(src_size).ok();
             Ok(TransferResult {
                 bytes_transferred: bytes,
                 skipped: false,

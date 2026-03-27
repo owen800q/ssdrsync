@@ -88,6 +88,9 @@ pub fn preallocate(file: &File, size: u64) {
 /// copy_file_range - the fastest kernel copy path (what modern cp uses).
 /// Zero-copy within kernel, supports server-side copy on NFS, reflink on btrfs/xfs.
 /// Uses 128MB chunks to minimize syscall overhead.
+///
+/// NOTE: No fallocate or fadvise here. copy_file_range is kernel-to-kernel
+/// and doesn't benefit from either. fallocate adds 1-2s latency for large files.
 pub fn copy_file_range_copy(
     src: &File,
     dst: &File,
@@ -102,9 +105,6 @@ pub fn copy_file_range_copy(
     let mut total: u64 = 0;
     let mut src_off: i64 = 0;
     let mut dst_off: i64 = 0;
-
-    preallocate(dst, total_size);
-    advise_sequential(src);
 
     while total < total_size {
         let remaining = total_size - total;
@@ -137,14 +137,8 @@ pub fn copy_file_range_copy(
             break; // EOF
         }
 
-        let bytes = n as u64;
-        total += bytes;
-        progress_cb(bytes);
-
-        // Drop page cache every ~512MB to avoid memory pressure
-        if total % (512 * 1024 * 1024) == 0 {
-            advise_dontneed(dst, 0, total as i64);
-        }
+        total += n as u64;
+        progress_cb(n as u64);
     }
 
     Ok(total)
