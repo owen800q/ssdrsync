@@ -53,6 +53,11 @@ pub struct Cli {
     /// Disable progress bar
     #[arg(long)]
     pub no_progress: bool,
+
+    /// Print progress as plain log lines (for Jenkins/CI/cron). Interval in seconds.
+    /// Example: --log-progress 5 prints a status line every 5 seconds.
+    #[arg(long, value_name = "SECONDS", default_missing_value = "5", num_args = 0..=1)]
+    pub log_progress: Option<u64>,
 }
 
 impl Cli {
