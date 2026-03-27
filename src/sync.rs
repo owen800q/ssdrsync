@@ -8,7 +8,7 @@ use walkdir::WalkDir;
 use crate::cli::Cli;
 use crate::error::{Result, SsdrError};
 use crate::metadata;
-use crate::progress::SyncProgress;
+use crate::progress::{ProgressMode, SyncProgress};
 use crate::resume::Manifest;
 use crate::transfer::{self, TransferOptions};
 
@@ -78,7 +78,7 @@ pub async fn run_sync(cli: &Cli) -> Result<()> {
         .filter(|a| matches!(a, SyncAction::Delete { .. }))
         .count();
 
-    let progress = Arc::new(SyncProgress::new(total_files, total_bytes, !cli.no_progress));
+    let progress = Arc::new(SyncProgress::new(total_files, total_bytes, progress_mode(cli)));
 
     progress.println(&format!(
         "Sync: {} files to copy ({} bytes), {} skipped, {} to delete",
@@ -280,7 +280,7 @@ async fn sync_single_file(src: &Path, dst: &Path, cli: &Cli) -> Result<()> {
         }
     }
 
-    let progress = SyncProgress::new(1, src_size, !cli.no_progress);
+    let progress = SyncProgress::new(1, src_size, progress_mode(cli));
     let file_bar = progress.create_file_bar(
         src.file_name().unwrap().to_str().unwrap_or("file"),
         src_size,
@@ -410,6 +410,18 @@ fn plan_sync(src: &Path, dst: &Path, cli: &Cli) -> Result<Vec<SyncAction>> {
     }
 
     Ok(actions)
+}
+
+fn progress_mode(cli: &Cli) -> ProgressMode {
+    if let Some(interval) = cli.log_progress {
+        ProgressMode::Log {
+            interval_secs: if interval == 0 { 5 } else { interval },
+        }
+    } else if cli.no_progress {
+        ProgressMode::Hidden
+    } else {
+        ProgressMode::Bar
+    }
 }
 
 fn format_bytes(bytes: u64) -> String {
