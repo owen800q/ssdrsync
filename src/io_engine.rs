@@ -87,13 +87,18 @@ pub fn preallocate(file: &File, size: u64) {
 
 /// copy_file_range - the fastest kernel copy path (what modern cp uses).
 /// Zero-copy within kernel, supports server-side copy on NFS, reflink on btrfs/xfs.
+/// Uses 128MB chunks to minimize syscall overhead.
 pub fn copy_file_range_copy(
     src: &File,
     dst: &File,
     total_size: u64,
-    block_size: usize,
+    _block_size: usize,
     mut progress_cb: impl FnMut(u64),
 ) -> std::io::Result<u64> {
+    // Use 128MB chunks - much larger than block_size to reduce syscall count.
+    // For 10GB file: ~80 syscalls instead of ~10240.
+    const CHUNK_SIZE: usize = 128 * 1024 * 1024;
+
     let mut total: u64 = 0;
     let mut src_off: i64 = 0;
     let mut dst_off: i64 = 0;
@@ -103,7 +108,7 @@ pub fn copy_file_range_copy(
 
     while total < total_size {
         let remaining = total_size - total;
-        let chunk = remaining.min(block_size as u64) as usize;
+        let chunk = remaining.min(CHUNK_SIZE as u64) as usize;
 
         let n = unsafe {
             libc::syscall(
@@ -136,8 +141,8 @@ pub fn copy_file_range_copy(
         total += bytes;
         progress_cb(bytes);
 
-        // Drop page cache periodically to avoid memory pressure
-        if total % (block_size as u64 * 32) == 0 {
+        // Drop page cache every ~512MB to avoid memory pressure
+        if total % (512 * 1024 * 1024) == 0 {
             advise_dontneed(dst, 0, total as i64);
         }
     }
